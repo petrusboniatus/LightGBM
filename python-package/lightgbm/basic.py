@@ -9,12 +9,13 @@ from copy import deepcopy
 from functools import wraps
 from logging import Logger
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict
+from typing import Any, Dict, Generator
 
 import numpy as np
 import scipy.sparse
 
-from .compat import PANDAS_INSTALLED, concat, dt_DataTable, is_dtype_sparse, pd_DataFrame, pd_Series
+from .compat import (PANDAS_INSTALLED, concat, dt_DataTable, is_dtype_sparse,
+                     pd_DataFrame, pd_Series)
 from .libpath import find_lib_path
 
 
@@ -94,7 +95,6 @@ def _load_lib():
 
 _LIB = _load_lib()
 
-
 NUMERIC_TYPES = (int, float, bool)
 
 
@@ -126,21 +126,6 @@ def is_numpy_1d_array(data):
     return isinstance(data, np.ndarray) and len(data.shape) == 1
 
 
-def is_numpy_column_array(data):
-    """Check whether data is a column numpy array."""
-    if not isinstance(data, np.ndarray):
-        return False
-    shape = data.shape
-    return len(shape) == 2 and shape[1] == 1
-
-
-def cast_numpy_1d_array_to_dtype(array, dtype):
-    """Cast numpy 1d array to given dtype."""
-    if array.dtype == dtype:
-        return array
-    return array.astype(dtype=dtype, copy=False)
-
-
 def is_1d_list(data):
     """Check whether data is a 1-D list."""
     return isinstance(data, list) and (not data or is_numeric(data[0]))
@@ -149,11 +134,10 @@ def is_1d_list(data):
 def list_to_1d_numpy(data, dtype=np.float32, name='list'):
     """Convert data to numpy 1-D array."""
     if is_numpy_1d_array(data):
-        return cast_numpy_1d_array_to_dtype(data, dtype)
-    elif is_numpy_column_array(data):
-        _log_warning('Converting column-vector to 1d array')
-        array = data.ravel()
-        return cast_numpy_1d_array_to_dtype(array, dtype)
+        if data.dtype == dtype:
+            return data
+        else:
+            return data.astype(dtype=dtype, copy=False)
     elif is_1d_list(data):
         return np.array(data, dtype=dtype, copy=False)
     elif isinstance(data, pd_Series):
@@ -168,7 +152,7 @@ def list_to_1d_numpy(data, dtype=np.float32, name='list'):
 def cfloat32_array_to_numpy(cptr, length):
     """Convert a ctypes float pointer array to a numpy array."""
     if isinstance(cptr, ctypes.POINTER(ctypes.c_float)):
-        return np.ctypeslib.as_array(cptr, shape=(length,)).copy()
+        return np.fromiter(cptr, dtype=np.float32, count=length)
     else:
         raise RuntimeError('Expected float pointer')
 
@@ -176,7 +160,7 @@ def cfloat32_array_to_numpy(cptr, length):
 def cfloat64_array_to_numpy(cptr, length):
     """Convert a ctypes double pointer array to a numpy array."""
     if isinstance(cptr, ctypes.POINTER(ctypes.c_double)):
-        return np.ctypeslib.as_array(cptr, shape=(length,)).copy()
+        return np.fromiter(cptr, dtype=np.float64, count=length)
     else:
         raise RuntimeError('Expected double pointer')
 
@@ -184,7 +168,7 @@ def cfloat64_array_to_numpy(cptr, length):
 def cint32_array_to_numpy(cptr, length):
     """Convert a ctypes int pointer array to a numpy array."""
     if isinstance(cptr, ctypes.POINTER(ctypes.c_int32)):
-        return np.ctypeslib.as_array(cptr, shape=(length,)).copy()
+        return np.fromiter(cptr, dtype=np.int32, count=length)
     else:
         raise RuntimeError('Expected int32 pointer')
 
@@ -192,7 +176,7 @@ def cint32_array_to_numpy(cptr, length):
 def cint64_array_to_numpy(cptr, length):
     """Convert a ctypes int pointer array to a numpy array."""
     if isinstance(cptr, ctypes.POINTER(ctypes.c_int64)):
-        return np.ctypeslib.as_array(cptr, shape=(length,)).copy()
+        return np.fromiter(cptr, dtype=np.int64, count=length)
     else:
         raise RuntimeError('Expected int64 pointer')
 
@@ -229,6 +213,7 @@ def param_dict_to_str(data):
                     return "[{}]".format(','.join(map(str, x)))
                 else:
                     return str(x)
+
             pairs.append(str(key) + '=' + ','.join(map(to_string, val)))
         elif isinstance(val, (str, NUMERIC_TYPES)) or is_numeric(val):
             pairs.append(str(key) + '=' + str(val))
@@ -469,7 +454,7 @@ def c_float_array(data):
                             .format(data.dtype))
     else:
         raise TypeError("Unknown type({})".format(type(data).__name__))
-    return (ptr_data, type_data, data)  # return `data` to avoid the temporary copy is freed
+    return ptr_data, type_data, data  # return `data` to avoid the temporary copy is freed
 
 
 def c_int_array(data):
@@ -491,6 +476,16 @@ def c_int_array(data):
     else:
         raise TypeError("Unknown type({})".format(type(data).__name__))
     return (ptr_data, type_data, data)  # return `data` to avoid the temporary copy is freed
+
+
+def np2d_to_c_ptr(mat):
+    if len(mat.shape) != 2:
+        raise ValueError('Input numpy.ndarray must be 2 dimensional')
+    if mat.dtype == np.float32 or mat.dtype == np.float64:
+        data = np.array(mat.reshape(mat.size), dtype=mat.dtype, copy=False)
+    else:  # change non-float data to float data, need to copy
+        data = np.array(mat.reshape(mat.size), dtype=np.float32)
+    return c_float_array(data)
 
 
 def _get_bad_pandas_dtypes(dtypes):
@@ -807,7 +802,8 @@ class _InnerPredictor:
         if nrow > MAX_INT32:
             sections = np.arange(start=MAX_INT32, stop=nrow, step=MAX_INT32)
             # __get_num_preds() cannot work with nrow > MAX_INT32, so calculate overall number of predictions piecemeal
-            n_preds = [self.__get_num_preds(start_iteration, num_iteration, i, predict_type) for i in np.diff([0] + list(sections) + [nrow])]
+            n_preds = [self.__get_num_preds(start_iteration, num_iteration, i, predict_type) for i in
+                       np.diff([0] + list(sections) + [nrow])]
             n_preds_sections = np.array([0] + n_preds, dtype=np.intp).cumsum()
             preds = np.zeros(sum(n_preds), dtype=np.float64)
             for chunk, (start_idx_pred, end_idx_pred) in zip(np.array_split(mat, sections),
@@ -866,6 +862,7 @@ class _InnerPredictor:
 
     def __pred_for_csr(self, csr, start_iteration, num_iteration, predict_type):
         """Predict for a CSR data."""
+
         def inner_predict(csr, start_iteration, num_iteration, predict_type, preds=None):
             nrow = len(csr.indptr) - 1
             n_preds = self.__get_num_preds(start_iteration, num_iteration, nrow, predict_type)
@@ -950,15 +947,18 @@ class _InnerPredictor:
             n_preds_sections = np.array([0] + n_preds, dtype=np.intp).cumsum()
             preds = np.zeros(sum(n_preds), dtype=np.float64)
             for (start_idx, end_idx), (start_idx_pred, end_idx_pred) in zip(zip(sections, sections[1:]),
-                                                                            zip(n_preds_sections, n_preds_sections[1:])):
+                                                                            zip(n_preds_sections,
+                                                                                n_preds_sections[1:])):
                 # avoid memory consumption by arrays concatenation operations
-                inner_predict(csr[start_idx:end_idx], start_iteration, num_iteration, predict_type, preds[start_idx_pred:end_idx_pred])
+                inner_predict(csr[start_idx:end_idx], start_iteration, num_iteration, predict_type,
+                              preds[start_idx_pred:end_idx_pred])
             return preds, nrow
         else:
             return inner_predict(csr, start_iteration, num_iteration, predict_type)
 
     def __pred_for_csc(self, csc, start_iteration, num_iteration, predict_type):
         """Predict for a CSC data."""
+
         def inner_predict_sparse(csc, start_iteration, num_iteration, predict_type):
             ptr_indptr, type_ptr_indptr, __ = c_int_array(csc.indptr)
             ptr_data, type_ptr_data, _ = c_float_array(csc.data)
@@ -1063,7 +1063,7 @@ class Dataset:
             Data source of Dataset.
             If string, it represents the path to txt file.
         label : list, numpy 1-D array, pandas Series / one-column DataFrame or None, optional (default=None)
-            Label of the data.
+            Label of the data.3QW
         reference : Dataset or None, optional (default=None)
             If this is Dataset for validation, training data should be used as reference.
         weight : list, numpy 1-D array, pandas Series or None, optional (default=None)
@@ -1181,7 +1181,8 @@ class Dataset:
                     assert num_data == len(used_indices)
                     for i in range(len(used_indices)):
                         for j in range(predictor.num_class):
-                            sub_init_score[i * predictor.num_class + j] = init_score[used_indices[i] * predictor.num_class + j]
+                            sub_init_score[i * predictor.num_class + j] = init_score[
+                                used_indices[i] * predictor.num_class + j]
                     init_score = sub_init_score
             if predictor.num_class > 1:
                 # need to regroup init_score
@@ -1215,8 +1216,8 @@ class Dataset:
         # process for args
         params = {} if params is None else params
         args_names = (getattr(self.__class__, '_lazy_init')
-                      .__code__
-                      .co_varnames[:getattr(self.__class__, '_lazy_init').__code__.co_argcount])
+                          .__code__
+                          .co_varnames[:getattr(self.__class__, '_lazy_init').__code__.co_argcount])
         for key, _ in params.items():
             if key in args_names:
                 _log_warning('{0} keyword has been found in `params` and will be ignored.\n'
@@ -1270,6 +1271,12 @@ class Dataset:
             self.__init_from_np2d(data, params_str, ref_dataset)
         elif isinstance(data, list) and len(data) > 0 and all(isinstance(x, np.ndarray) for x in data):
             self.__init_from_list_np2d(data, params_str, ref_dataset)
+        elif (isinstance(data, tuple)
+              and isinstance(data[0], Generator)
+              and hasattr(data[1], "__len__") and hasattr(data[1], "__getitem__")
+              and all(isinstance(x, int) for x in data[1])
+              and len(data[1]) == 2):
+            self.__init_from_np2d_generator(data[0], data[1], params_str, ref_dataset)
         elif isinstance(data, dt_DataTable):
             self.__init_from_np2d(data.to_numpy(), params_str, ref_dataset)
         else:
@@ -1299,16 +1306,7 @@ class Dataset:
 
     def __init_from_np2d(self, mat, params_str, ref_dataset):
         """Initialize data from a 2-D numpy matrix."""
-        if len(mat.shape) != 2:
-            raise ValueError('Input numpy.ndarray must be 2 dimensional')
-
-        self.handle = ctypes.c_void_p()
-        if mat.dtype == np.float32 or mat.dtype == np.float64:
-            data = np.array(mat.reshape(mat.size), dtype=mat.dtype, copy=False)
-        else:  # change non-float data to float data, need to copy
-            data = np.array(mat.reshape(mat.size), dtype=np.float32)
-
-        ptr_data, type_ptr_data, _ = c_float_array(data)
+        ptr_data, type_ptr_data, _data = np2d_to_c_ptr(mat)
         _safe_call(_LIB.LGBM_DatasetCreateFromMat(
             ptr_data,
             ctypes.c_int(type_ptr_data),
@@ -1319,6 +1317,45 @@ class Dataset:
             ref_dataset,
             ctypes.byref(self.handle)))
         return self
+
+    def __init_from_np2d_generator(self, generator, shape, params_str, ref_dataset):
+        self.handle = ctypes.c_void_p()
+        have_to_create_ref = ref_dataset is None
+        row_to_insert = 0
+
+        for data_chunk in generator:
+            ptr_data, type_ptr_data, _data = np2d_to_c_ptr(data_chunk)
+            if row_to_insert == 0 and have_to_create_ref:
+                ref_dataset = ctypes.c_void_p()
+                _safe_call(_LIB.LGBM_DatasetCreateFromMat(
+                    ptr_data,
+                    ctypes.c_int(type_ptr_data),
+                    ctypes.c_int(data_chunk.shape[0]),
+                    ctypes.c_int(data_chunk.shape[1]),
+                    ctypes.c_int(C_API_IS_ROW_MAJOR),
+                    c_str(params_str),
+                    None,
+                    ctypes.byref(ref_dataset)))
+
+            if row_to_insert == 0:
+                _safe_call(_LIB.LGBM_DatasetCreateByReference(
+                    ref_dataset,
+                    ctypes.c_int(shape[0]),
+                    ctypes.byref(self.handle)))
+
+            if i == 0 and have_to_create_ref:
+                _safe_call(_LIB.LGBM_DatasetFree(ref_dataset))
+
+            _safe_call(_LIB.LGBM_DatasetPushRows(
+                self.handle,
+                ptr_data,
+                type_ptr_data,
+                ctypes.c_int(data_chunk.shape[0]),
+                ctypes.c_int(data_chunk.shape[1]),
+                ctypes.c_int(row_to_insert)))
+
+            row_to_insert = row_to_insert + data_chunk.shape[0]
+
 
     def __init_from_list_np2d(self, mats, params_str, ref_dataset):
         """Initialize data from a list of 2-D numpy matrices."""
@@ -1444,8 +1481,9 @@ class Dataset:
                     assert used_indices.flags.c_contiguous
                     if self.reference.group is not None:
                         group_info = np.array(self.reference.group).astype(np.int32, copy=False)
-                        _, self.group = np.unique(np.repeat(range(len(group_info)), repeats=group_info)[self.used_indices],
-                                                  return_counts=True)
+                        _, self.group = np.unique(
+                            np.repeat(range(len(group_info)), repeats=group_info)[self.used_indices],
+                            return_counts=True)
                     self.handle = ctypes.c_void_p()
                     params_str = param_dict_to_str(self.params)
                     _safe_call(_LIB.LGBM_DatasetGetSubset(
@@ -1460,7 +1498,8 @@ class Dataset:
                         self.set_group(self.group)
                     if self.get_label() is None:
                         raise ValueError("Label should not be None.")
-                    if isinstance(self._predictor, _InnerPredictor) and self._predictor is not self.reference._predictor:
+                    if isinstance(self._predictor,
+                                  _InnerPredictor) and self._predictor is not self.reference._predictor:
                         self.get_data()
                         self._set_init_score_by_predictor(self._predictor, self.data, used_indices)
             else:
@@ -1716,7 +1755,8 @@ class Dataset:
         It is not recommended for user to call this function.
         Please use init_model argument in engine.train() or engine.cv() instead.
         """
-        if predictor is self._predictor and (predictor is None or predictor.current_iteration() == self._predictor.current_iteration()):
+        if predictor is self._predictor and (
+            predictor is None or predictor.current_iteration() == self._predictor.current_iteration()):
             return self
         if self.handle is None:
             self._predictor = predictor
@@ -1896,7 +1936,7 @@ class Dataset:
         if reserved_string_buffer_size < required_string_buffer_size.value:
             raise BufferError(
                 "Allocated feature name buffer size ({}) was inferior to the needed size ({})."
-                .format(reserved_string_buffer_size, required_string_buffer_size.value)
+                    .format(reserved_string_buffer_size, required_string_buffer_size.value)
             )
         return [string_buffers[i].value.decode('utf-8') for i in range(num_feature)]
 
@@ -2349,7 +2389,7 @@ class Booster:
         listen_time_out : int, optional (default=120)
             Socket time-out in minutes.
         num_machines : int, optional (default=1)
-            The number of machines for distributed learning application.
+            The number of machines for parallel learning application.
 
         Returns
         -------
@@ -3257,7 +3297,7 @@ class Booster:
         if reserved_string_buffer_size < required_string_buffer_size.value:
             raise BufferError(
                 "Allocated feature name buffer size ({}) was inferior to the needed size ({})."
-                .format(reserved_string_buffer_size, required_string_buffer_size.value)
+                    .format(reserved_string_buffer_size, required_string_buffer_size.value)
             )
         return [string_buffers[i].value.decode('utf-8') for i in range(num_feature)]
 
@@ -3327,6 +3367,7 @@ class Booster:
         result_array_like : numpy array or pandas DataFrame (if pandas is installed)
             If ``xgboost_style=True``, the histogram of used splitting values for the specified feature.
         """
+
         def add(root):
             """Recursively add thresholds."""
             if 'split_index' in root:  # non-leaf
@@ -3456,7 +3497,7 @@ class Booster:
                 if reserved_string_buffer_size < required_string_buffer_size.value:
                     raise BufferError(
                         "Allocated eval name buffer size ({}) was inferior to the needed size ({})."
-                        .format(reserved_string_buffer_size, required_string_buffer_size.value)
+                            .format(reserved_string_buffer_size, required_string_buffer_size.value)
                     )
                 self.__name_inner_eval = \
                     [string_buffers[i].value.decode('utf-8') for i in range(self.__num_inner_eval)]

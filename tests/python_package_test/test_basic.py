@@ -8,7 +8,6 @@ from sklearn.datasets import dump_svmlight_file, load_svmlight_file
 from sklearn.model_selection import train_test_split
 
 import lightgbm as lgb
-from lightgbm.compat import PANDAS_INSTALLED, pd_Series
 
 from .utils import load_breast_cancer
 
@@ -96,6 +95,21 @@ def test_chunked_dataset():
     valid_data = train_data.create_valid(X_test, label=y_test, params={"bin_construct_sample_cnt": 100})
     train_data.construct()
     valid_data.construct()
+
+def test_chunked_dataset_with_generator():
+    cancer = np.linspace(0.0, 10.0, num=(600*30)).reshape([600, 30])
+    shape = cancer.shape
+    chunk_size = 20
+
+    def cancer_generator():
+        for i in range(0, shape[0], chunk_size):
+            current_chunk_size = min(i + chunk_size, shape[0])
+            yield cancer[i:current_chunk_size, :]
+
+    dt = lgb.Dataset(data=(cancer_generator(), cancer.shape))
+    dt.construct()
+
+
 
 
 def test_chunked_dataset_linear():
@@ -376,33 +390,3 @@ def test_choose_param_value():
         "num_trees": 81
     }
     assert original_params == expected_params
-
-
-@pytest.mark.skipif(not PANDAS_INSTALLED, reason='pandas is not installed')
-@pytest.mark.parametrize(
-    'y',
-    [
-        np.random.rand(10),
-        np.random.rand(10, 1),
-        pd_Series(np.random.rand(10)),
-        pd_Series(['a', 'b']),
-        [1] * 10,
-        [[1], [2]]
-    ])
-@pytest.mark.parametrize('dtype', [np.float32, np.float64])
-def test_list_to_1d_numpy(y, dtype):
-    if isinstance(y, np.ndarray) and len(y.shape) == 2:
-        with pytest.warns(UserWarning, match='column-vector'):
-            lgb.basic.list_to_1d_numpy(y)
-        return
-    elif isinstance(y, list) and isinstance(y[0], list):
-        with pytest.raises(TypeError):
-            lgb.basic.list_to_1d_numpy(y)
-        return
-    elif isinstance(y, pd_Series) and y.dtype == object:
-        with pytest.raises(ValueError):
-            lgb.basic.list_to_1d_numpy(y)
-        return
-    result = lgb.basic.list_to_1d_numpy(y, dtype=dtype)
-    assert result.size == 10
-    assert result.dtype == dtype
